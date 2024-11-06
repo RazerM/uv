@@ -3,17 +3,20 @@ mod pep639_glob;
 
 use crate::metadata::{PyProjectToml, ValidationError};
 use crate::pep639_glob::Pep639GlobError;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use fs_err::File;
 use glob::{GlobError, PatternError};
 use itertools::Itertools;
 use sha2::{Digest, Sha256};
 use std::fs::FileType;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf, StripPrefixError};
 use std::{io, mem};
+use tar::Header;
 use thiserror::Error;
 use tracing::{debug, trace};
-use uv_distribution_filename::WheelFilename;
+use uv_distribution_filename::{SourceDistExtension, SourceDistFilename, WheelFilename};
 use uv_fs::Simplified;
 use walkdir::WalkDir;
 use zip::{CompressionMethod, ZipWriter};
@@ -53,6 +56,8 @@ pub enum Error {
     MissingModule(PathBuf),
     #[error("Inconsistent metadata between prepare and build step: `{0}`")]
     InconsistentSteps(&'static str),
+    #[error("Failed to write to {}", _0.user_display())]
+    TarWrite(PathBuf, #[source] io::Error),
 }
 
 /// Allow dispatching between writing to a directory, writing to zip and writing to a `.tar.gz`.
@@ -276,7 +281,7 @@ fn write_hashed(
 }
 
 /// Build a wheel from the source tree and place it in the output directory.
-pub fn build(
+pub fn build_wheel(
     source_tree: &Path,
     wheel_dir: &Path,
     metadata_directory: Option<&Path>,
@@ -342,6 +347,72 @@ pub fn build(
     Ok(filename)
 }
 
+/// Build a source distribution from the source tree and place it in the output directory.
+pub fn build_source_dist(
+    source_tree: &Path,
+    source_dist_directory: &Path,
+    uv_version: &str,
+) -> Result<SourceDistFilename, Error> {
+    let contents = fs_err::read_to_string(source_tree.join("pyproject.toml"))?;
+    let pyproject_toml = PyProjectToml::parse(&contents)?;
+    pyproject_toml.check_build_system(uv_version);
+
+    let filename = SourceDistFilename {
+        name: pyproject_toml.name().clone(),
+        version: pyproject_toml.version().clone(),
+        extension: SourceDistExtension::TarGz,
+    };
+
+    let top_level = format!("{}-{}", pyproject_toml.name(), pyproject_toml.version());
+
+    let source_dist_path = source_dist_directory.join(filename.to_string());
+    let tar_gz = File::create(&source_dist_path)?;
+    let enc = GzEncoder::new(tar_gz, Compression::default());
+    let mut tar = tar::Builder::new(enc);
+
+    let metadata = pyproject_toml
+        .to_metadata(source_tree)?
+        .core_metadata_format();
+
+    let mut header = Header::new_gnu();
+    header.set_size(metadata.bytes().len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append_data(
+        &mut header,
+        Path::new(&top_level).join("PKG-INFO"),
+        Cursor::new(metadata),
+    )
+    .map_err(|err| Error::TarWrite(source_dist_path.clone(), err))?;
+
+    // Desired features:
+    // `include`, `extend-include`, `exclude`, `extend-exclude`
+    // I want to be able to both include/exclude specific folder, specific files and files by extension
+    // include: ["src/", "pyproject.toml"] + readme and license
+    // extend-include: ["license*"]
+    // exclude: ["**/*.pyc", "**/*.pyo", "**/__pycache__"]
+    // "*.py"
+    for file in WalkDir::new(&source_tree).into_iter().filter_entry(|dir| {
+        let relative = dir.path().strip_prefix(&source_tree).unwrap();
+        relative == Path::new("")
+            || relative
+                .components()
+                .next()
+                .is_some_and(|start| start.as_os_str() == "src")
+    }) {
+        let file = file.map_err(|err| Error::WalkDir {
+            root: source_tree.to_path_buf(),
+            err,
+        })?;
+        dbg!(file);
+    }
+
+    tar.finish()
+        .map_err(|err| Error::TarWrite(source_dist_path.clone(), err))?;
+
+    Ok(filename)
+}
+
 /// Write the dist-info directory to the output directory without building the wheel.
 pub fn metadata(
     source_tree: &Path,
@@ -350,7 +421,7 @@ pub fn metadata(
 ) -> Result<String, Error> {
     let contents = fs_err::read_to_string(source_tree.join("pyproject.toml"))?;
     let pyproject_toml = PyProjectToml::parse(&contents)?;
-    pyproject_toml.check_build_system("1.0.0+test");
+    pyproject_toml.check_build_system(uv_version);
 
     let filename = WheelFilename {
         name: pyproject_toml.name().clone(),
